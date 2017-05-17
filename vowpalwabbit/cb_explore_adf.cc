@@ -4,6 +4,7 @@
 #include "bs.h"
 #include "gen_cs_example.h"
 #include "cb_explore.h"
+#include <deque>
 
 using namespace LEARNER;
 using namespace ACTION_SCORE;
@@ -21,6 +22,8 @@ using namespace CB_ALGS;
 #define SOFTMAX 3
 //cover
 #define COVER 4
+//adaptive epsilon greedy
+#define ADAPTIVE_EPS_GREEDY 5
 
 namespace CB_EXPLORE_ADF
 {
@@ -38,6 +41,14 @@ struct cb_explore_adf
   float lambda;
   uint64_t offset;
 
+  float dev_cnt;
+  size_t num_base;
+  size_t base_length;
+  size_t length;
+  size_t leader;
+  deque<float> *recent_costs;  
+  float **sum_recent_costs;
+ 
   bool need_to_clear;
   vw* all;
   LEARNER::base_learner* cs_ldf_learner;
@@ -135,8 +146,89 @@ void predict_or_learn_first(cb_explore_adf& data, base_learner& base, v_array<ex
     for (size_t i = 0; i < num_actions; i++)
       preds[i].score = prob;
     preds[0].score += 1.f - data.epsilon;
+ 
+    //float cost = get_unbiased_cost(&data.gen_cs.known_cost, preds[0].action);
+    //cout << cost << endl;
   }
   
+template <bool is_learn>
+void predict_or_learn_adaptive(cb_explore_adf& data, base_learner& base, v_array<example*>& examples)
+{ 
+  multiline_learn_or_predict<false>(base, examples, data.offset, data.leader);
+  
+  v_array<action_score>& preds = examples[0]->pred.a_s;
+  uint32_t num_actions = (uint32_t)preds.size();
+
+  data.action_probs.resize(num_actions);
+  data.action_probs.erase();
+
+  float prob = data.epsilon/(float)num_actions;
+  for(uint32_t i = 0; i < num_actions; i++)
+    data.action_probs.push_back({preds[i].action, prob});
+  
+  data.action_probs[0].score += (1.f - data.epsilon);
+
+  if (is_learn && test_adf_sequence(data.ec_seq) != nullptr) {
+    //float weight = ec.weight;
+    float eta = data.all->eta;
+    for(size_t i = 0;i < data.num_base; i++) {
+      //ec.weight = weight * sqrt(1 << (data.num_base - i - 1));
+      data.all->eta = eta * sqrt(1 << (data.num_base - i - 1));
+      
+      multiline_learn_or_predict<true>(base, examples, data.offset, i);
+      uint32_t chosen = preds[0].action;
+      
+      float cost = get_unbiased_cost(&data.gen_cs.known_cost, chosen);
+      //cout << cost << ' ';
+      data.recent_costs[i].push_front(cost);
+
+      // compute partial sums of recent costs when the queue first reaches its capacity
+      if (data.recent_costs[i].size() == data.base_length << i) {
+        uint32_t h = 0;
+        for(uint32_t j = 0; j <= i; j++) {
+          if(j != 0) data.sum_recent_costs[i][j] = data.sum_recent_costs[i][j-1];
+          for(uint32_t k = 0; k < data.base_length; k++, h++)
+            data.sum_recent_costs[i][j] += data.recent_costs[i][h];
+        } 
+      }
+      // update partial sums of recent costs
+      else if (data.recent_costs[i].size() > data.base_length << i) {
+        for(uint32_t j = 0; j <= i; j ++) {
+          data.sum_recent_costs[i][j] += cost - data.recent_costs[i][data.base_length << j];
+        }
+        data.recent_costs[i].pop_back();
+      }
+    }
+    //ec.weight = weight;
+    data.all->eta = eta;    
+
+    // find new leader by checking violations
+    data.leader = 0;
+    bool flag = false;
+    for(size_t i = 1; i < data.num_base; i++) {
+      if (data.recent_costs[i].size() < data.base_length << i) break;
+
+      for(uint32_t j = 0; j < i; j++) {
+        float bound = data.dev_cnt * sqrt(num_actions * (data.base_length << j) / data.epsilon);
+        //cout << "diff = " << data.sum_recent_costs[j][j] - data.sum_recent_costs[i][j] << " bound = " << bound << endl; 
+        if (data.sum_recent_costs[i][j] - data.sum_recent_costs[j][j] > bound) {
+          flag = true; 
+          break;
+        }
+      }
+      if(flag) break;
+      else data.leader = i;
+    }
+    //cout << data.leader << endl; 
+  }
+
+  for (size_t i = 0; i < num_actions; i++)
+    preds[i] = data.action_probs[i];
+}
+
+
+
+
   template <bool is_learn>
   void predict_or_learn_bag(cb_explore_adf& data, base_learner& base, v_array<example*>& examples)
   { //Randomize over predictions from a base set of predictors
@@ -273,6 +365,10 @@ void finish(cb_explore_adf& data)
     data.prepped_cs_labels[i].costs.delete_v();
   data.prepped_cs_labels.delete_v();
   data.gen_cs.pred_scores.costs.delete_v();
+
+  delete[] data.recent_costs;
+  for (uint32_t i = 0; i < data.num_base; i++)
+    free(data.sum_recent_costs[i]);
 }
 
 
@@ -381,6 +477,9 @@ void do_actual_learning(cb_explore_adf& data, base_learner& base)
       case COVER:
         predict_or_learn_cover<false>(data, base, data.ec_seq);
         break;
+      case ADAPTIVE_EPS_GREEDY:
+        predict_or_learn_adaptive<false>(data, base, data.ec_seq);
+        break;
       default:
         THROW("Unknown explorer type specified for contextual bandit learning: " << data.explore_type);
     }
@@ -409,6 +508,9 @@ void do_actual_learning(cb_explore_adf& data, base_learner& base)
         break;
       case COVER:
         predict_or_learn_cover<is_learn>(data, base, data.ec_seq);
+        break;
+      case ADAPTIVE_EPS_GREEDY:
+        predict_or_learn_adaptive<is_learn>(data, base, data.ec_seq);
         break;
       default:
         THROW("Unknown explorer type specified for contextual bandit learning: " << data.explore_type);
@@ -463,6 +565,8 @@ base_learner* cb_explore_adf_setup(vw& all)
   ("bag", po::value<size_t>(), "bagging-based exploration")
   ("cover",po::value<size_t>() ,"Online cover based exploration")
   ("softmax", "softmax exploration")
+  ("dev_cnt", po::value<float>(), "constant for a deviation bound used in nonstationary environments")
+  ("length", po::value<size_t>(), "interval length of interest for nonstationary environments")
   ("lambda", po::value<float>(), "parameter for softmax");
   add_options(all);
 
@@ -514,10 +618,34 @@ base_learner* cb_explore_adf_setup(vw& all)
     sprintf(type_string, "%f", data.lambda);
     *all.file_options << " --softmax --lambda "<<type_string;
   }
-  else if (vm.count("epsilon"))
-    data.explore_type = EPS_GREEDY;
+  else if (vm.count("length"))
+  {
+    data.explore_type = ADAPTIVE_EPS_GREEDY; 
+    data.length = (uint32_t)vm["length"].as<size_t>();
+
+    if (!vm.count("epsilon"))
+      data.epsilon = 0.05f;
+
+    data.dev_cnt = 2;
+    if (vm.count("dev_cnt"))
+      data.dev_cnt = vm["dev_cnt"].as<float>();
+
+    data.leader = 0;
+    data.base_length = 100;
+    data.num_base = log2(max(data.base_length, data.length-1.0) / data.base_length) + 1;
+    problem_multiplier = data.num_base;
+
+    data.recent_costs = new deque<float>[data.num_base];
+    data.sum_recent_costs = calloc_or_throw<float*>(data.num_base);
+
+    for(uint32_t i = 0; i < data.num_base; i++)
+      data.sum_recent_costs[i] = calloc_or_throw<float>(i+1);
+    
+    sprintf(type_string, "%lu", data.length);
+    *all.file_options << " --length "<<type_string;
+  }
   else //epsilon
-  { data.epsilon = 0.05f;
+  { if (!vm.count("epsilon")) data.epsilon = 0.05f;
     data.explore_type = EPS_GREEDY;
   }
 

@@ -3,6 +3,7 @@
 #include "rand48.h"
 #include "bs.h"
 #include "gen_cs_example.h"
+#include <deque>
 
 using namespace LEARNER;
 using namespace ACTION_SCORE;
@@ -33,6 +34,14 @@ namespace CB_EXPLORE
     size_t cover_size;
     
     size_t counter;
+ 
+    float dev_cnt;
+    size_t num_base;
+    size_t base_length;
+    size_t length;
+    size_t leader;
+    deque<float> *recent_costs;  
+    float **sum_recent_costs;
     
 };
 
@@ -71,8 +80,14 @@ void predict_or_learn_greedy(cb_explore& data, base_learner& base, example& ec)
   v_array<action_score> probs = ec.pred.a_s;
   probs.erase();
 
-  if (is_learn)
+  if (is_learn) {
     base.learn(ec);
+
+    /*uint32_t chosen = ec.pred.multiclass;
+    CB::cb_class* cl = get_observed_cost(ec.l.cb);
+    float cost = get_unbiased_cost(cl, chosen);
+    cout << cost << endl;*/
+  }
   else
     base.predict(ec);
 
@@ -105,6 +120,77 @@ void predict_or_learn_bag(cb_explore& data, base_learner& base, example& ec)
     if (is_learn)
       for (uint32_t j = 1; j < count; j++)
 	base.learn(ec,i);
+  }
+  
+  ec.pred.a_s = probs;
+}
+
+template <bool is_learn>
+void predict_or_learn_adaptive(cb_explore& data, base_learner& base, example& ec)
+{ 
+  v_array<action_score> probs = ec.pred.a_s;
+  probs.erase();
+  
+  float prob = data.epsilon/(float)data.cbcs.num_actions;
+  for(uint32_t i = 0; i < data.cbcs.num_actions; i++)
+    probs.push_back({i,prob});
+  
+  base.predict(ec, data.leader);
+  uint32_t chosen = ec.pred.multiclass;
+  probs[chosen-1].score += (1 - data.epsilon);
+
+  if (is_learn) {
+    //float weight = ec.weight;
+    float eta = data.all->eta;
+    for(size_t i = 0;i < data.num_base; i++) {
+      //ec.weight = weight * sqrt(1 << (data.num_base - i - 1));
+      data.all->eta = eta * sqrt(1 << (data.num_base - i - 1));
+      base.learn(ec,i);
+      chosen = ec.pred.multiclass;
+      
+      CB::cb_class* cl = get_observed_cost(ec.l.cb);
+      float cost = get_unbiased_cost(cl, chosen);
+      //cout << cost << ' ';
+      data.recent_costs[i].push_front(cost);
+
+      // compute partial sums of recent costs when the queue first reaches its capacity
+      if (data.recent_costs[i].size() == data.base_length << i) {
+        uint32_t h = 0;
+        for(uint32_t j = 0; j <= i; j++) {
+          if(j != 0) data.sum_recent_costs[i][j] = data.sum_recent_costs[i][j-1];
+          for(uint32_t k = 0; k < data.base_length; k++, h++)
+            data.sum_recent_costs[i][j] += data.recent_costs[i][h];
+        } 
+      }
+      // update partial sums of recent costs
+      else if (data.recent_costs[i].size() > data.base_length << i) {
+        for(uint32_t j = 0; j <= i; j ++) {
+          data.sum_recent_costs[i][j] += cost - data.recent_costs[i][data.base_length << j];
+        }
+        data.recent_costs[i].pop_back();
+      }
+    }
+    //ec.weight = weight;
+    data.all->eta = eta;    
+
+    // find new leader by checking violations
+    data.leader = 0;
+    bool flag = false;
+    for(size_t i = 1; i < data.num_base; i++) {
+      if (data.recent_costs[i].size() < data.base_length << i) break;
+
+      for(uint32_t j = 0; j < i; j++) {
+        float bound = data.dev_cnt * sqrt(data.cbcs.num_actions * (data.base_length << j) / data.epsilon);
+        //cout << "diff = " << data.sum_recent_costs[j][j] - data.sum_recent_costs[i][j] << " bound = " << bound << endl; 
+        if (data.sum_recent_costs[i][j] - data.sum_recent_costs[j][j] > bound) {
+          flag = true; 
+          break;
+        }
+      }
+      if(flag) break;
+      else data.leader = i;
+    }
+    //cout << data.leader << endl; 
   }
   
   ec.pred.a_s = probs;
@@ -237,6 +323,10 @@ void finish(cb_explore& data)
   COST_SENSITIVE::cs_label.delete_label(&c.pred_scores);
   COST_SENSITIVE::cs_label.delete_label(&data.cs_label);
   COST_SENSITIVE::cs_label.delete_label(&data.second_cs_label);
+
+  delete[] data.recent_costs;
+  for (uint32_t i = 0; i < data.num_base; i++)
+    free(data.sum_recent_costs[i]);
 }
 
 void print_update_cb_explore(vw& all, bool is_test, example& ec, stringstream& pred_string)
@@ -257,7 +347,7 @@ void output_example(vw& all, cb_explore& data, example& ec, CB::label& ld)
 
   if ((c.known_cost = get_observed_cost(ld)) != nullptr)
     for(uint32_t i = 0; i < ec.pred.a_s.size(); i++)
-      loss += get_unbiased_cost(c.known_cost, c.pred_scores, i)*ec.pred.a_s[i].score;
+      loss += get_unbiased_cost(c.known_cost, i+1)*ec.pred.a_s[i].score;
 
   all.sd->update(ec.test_only, loss, 1.f, ec.num_features);
 
@@ -301,7 +391,9 @@ base_learner* cb_explore_setup(vw& all)
   ("first", po::value<size_t>(), "tau-first exploration")
   ("epsilon",po::value<float>() ,"epsilon-greedy exploration")
   ("bag",po::value<size_t>() ,"bagging-based exploration")
-  ("cover",po::value<size_t>() ,"Online cover based exploration");
+  ("cover",po::value<size_t>() ,"Online cover based exploration")
+  ("dev_cnt", po::value<float>(), "constant for a deviation bound used in nonstationary environments")
+  ("length", po::value<size_t>(), "interval length of interest for nonstationary environments");
   add_options(all);
 
   po::variables_map& vm = all.vm;
@@ -360,6 +452,33 @@ base_learner* cb_explore_setup(vw& all)
     sprintf(type_string, "%lu", data.tau);
     *all.file_options << " --first "<<type_string;
     l = &init_learner(&data, base, predict_or_learn_first<true>, predict_or_learn_first<false>, 1, prediction_type::action_probs);
+  }
+  else if (vm.count("length"))
+  { 
+    data.length = (uint32_t)vm["length"].as<size_t>();
+
+    data.epsilon = 0.05f;
+    if (vm.count("epsilon"))
+      data.epsilon = vm["epsilon"].as<float>();
+
+    data.dev_cnt = 2;
+    if (vm.count("dev_cnt"))
+      data.dev_cnt = vm["dev_cnt"].as<float>();
+
+    data.leader = 0;
+    data.base_length = 100;
+    data.num_base = log2(max(data.base_length, data.length-1.0) / data.base_length) + 1;
+
+    data.recent_costs = new deque<float>[data.num_base];
+    data.sum_recent_costs = calloc_or_throw<float*>(data.num_base);
+
+    for(uint32_t i = 0; i < data.num_base; i++)
+      data.sum_recent_costs[i] = calloc_or_throw<float>(i+1);
+    
+    sprintf(type_string, "%lu", data.length);
+    *all.file_options << " --length "<<type_string;
+    
+    l = &init_learner(&data, base, predict_or_learn_adaptive<true>, predict_or_learn_adaptive<false>, data.num_base, prediction_type::action_probs);
   }
   else
   { data.epsilon = 0.05f;
