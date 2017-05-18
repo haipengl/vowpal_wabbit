@@ -40,6 +40,8 @@ namespace CB_EXPLORE
     size_t base_length;
     size_t length;
     size_t leader;
+    bool output_leader;
+    bool output_cost;
     deque<float> *recent_costs;  
     float **sum_recent_costs;
     
@@ -84,6 +86,7 @@ void predict_or_learn_greedy(cb_explore& data, base_learner& base, example& ec)
     base.learn(ec);
 
     /*uint32_t chosen = ec.pred.multiclass;
+      
     CB::cb_class* cl = get_observed_cost(ec.l.cb);
     float cost = get_unbiased_cost(cl, chosen);
     cout << cost << endl;*/
@@ -150,7 +153,15 @@ void predict_or_learn_adaptive(cb_explore& data, base_learner& base, example& ec
       
       CB::cb_class* cl = get_observed_cost(ec.l.cb);
       float cost = get_unbiased_cost(cl, chosen);
-      //cout << cost << ' ';
+      
+      if(data.output_cost) {
+          cout << cost << ' ';
+          if (chosen = ec.l.cb.costs[0].action)
+              cout << 1.0 / ec.l.cb.costs[0].probability << ' ';
+          else
+              cout << 0 << ' ';
+      }
+
       data.recent_costs[i].push_front(cost);
 
       // compute partial sums of recent costs when the queue first reaches its capacity
@@ -181,6 +192,7 @@ void predict_or_learn_adaptive(cb_explore& data, base_learner& base, example& ec
 
       for(uint32_t j = 0; j < i; j++) {
         float bound = data.dev_cnt * sqrt(data.cbcs.num_actions * (data.base_length << j) / data.epsilon);
+        //float bound = data.dev_cnt * (sqrt(data.cbcs.num_actions * data.sum_recent_costs[j][j] / data.epsilon) + data.cbcs.num_actions / data.epsilon) ;
         //cout << "diff = " << data.sum_recent_costs[j][j] - data.sum_recent_costs[i][j] << " bound = " << bound << endl; 
         if (data.sum_recent_costs[i][j] - data.sum_recent_costs[j][j] > bound) {
           flag = true; 
@@ -190,7 +202,8 @@ void predict_or_learn_adaptive(cb_explore& data, base_learner& base, example& ec
       if(flag) break;
       else data.leader = i;
     }
-    //cout << data.leader << endl; 
+    if(data.output_leader) cout << data.leader << endl; 
+    else if(data.output_cost) cout << endl;
   }
   
   ec.pred.a_s = probs;
@@ -393,6 +406,8 @@ base_learner* cb_explore_setup(vw& all)
   ("bag",po::value<size_t>() ,"bagging-based exploration")
   ("cover",po::value<size_t>() ,"Online cover based exploration")
   ("dev_cnt", po::value<float>(), "constant for a deviation bound used in nonstationary environments")
+  ("output_leader", po::value<bool>(), "output leader id at each time")
+  ("output_cost", po::value<bool>(), "output the cost of each base learner at each time")
   ("length", po::value<size_t>(), "interval length of interest for nonstationary environments");
   add_options(all);
 
@@ -465,6 +480,14 @@ base_learner* cb_explore_setup(vw& all)
     if (vm.count("dev_cnt"))
       data.dev_cnt = vm["dev_cnt"].as<float>();
 
+    data.output_leader = false;
+    if (vm.count("output_leader"))
+      data.output_leader = vm["output_leader"].as<bool>();
+
+    data.output_cost = false;
+    if (vm.count("output_cost"))
+      data.output_cost = vm["output_cost"].as<bool>();
+   
     data.leader = 0;
     data.base_length = 100;
     data.num_base = log2(max(data.base_length, data.length-1.0) / data.base_length) + 1;
